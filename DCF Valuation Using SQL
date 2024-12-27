@@ -1,0 +1,160 @@
+'<File Import>
+#Step 1: import s&p historical prices, stock historical prices, stock financial statements as csv from yfinance
+#Step 2: rename columns of s&p historical prices and stock historical prices csv files to "date" for the first column and lower-cased and underscored names for the other columns
+#Step 3: rename stock financial statements (all 3) columns from date format to text format (e.g. q2_24), then transpose the tables'
+_____________________________________________________________________________________________________________________________________________________________________________
+
+'<Finding Beta>
+#Step 1: load s&p historical prices and stock historical prices to the database and join the two tables
+#Step 2: calculate beta using slope method as a separate table
+Assumption: stock daily gain over 15% is exempted'
+
+
+CREATE TABLE stock_sp_table AS
+	WITH stock_table AS (
+	SELECT date(date) AS stock_date, close AS stock_close,
+	(close + close - sum(close) OVER(ORDER BY date ROWS BETWEEN 1 PRECEDING AND CURRENT ROW))/(sum(close) OVER(ORDER BY date ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) - close) AS stock_daily_gain,
+	((close - LEAD(close, 30) OVER (ORDER BY date)) / LEAD(close, 30) OVER (ORDER BY date) * 100) AS stock_futr_30,
+	avg(close) OVER(ORDER BY date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS stock_mav_5,
+	avg(close) OVER(ORDER BY date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS stock_mav_30,
+	close - (SELECT avg(close) FROM stock_db) AS stock_dev
+	FROM stock_db
+	WHERE date > 2000
+	),
+	sp_table AS (
+	SELECT date(date) AS sp_date, close AS sp_close,
+	(close + close - sum(close) OVER(ORDER BY date ROWS BETWEEN 1 PRECEDING AND CURRENT ROW))/(sum(close) OVER(ORDER BY date ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) - close) AS sp_daily_gain,
+	((close - LAG(close, 30) OVER (ORDER BY date)) / LAG(close, 30) OVER (ORDER BY date) * 100) AS sp_past_30,
+	avg(close) OVER(ORDER BY date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS sp_mav_5,
+	avg(close) OVER(ORDER BY date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS sp_mav_30,
+	close - (SELECT avg(close) FROM sp_db) AS sp_dev,
+	(close - (SELECT avg(close) FROM sp_db))*(close - (SELECT avg(close) FROM sp_db)) AS sp_cov_sq
+	FROM sp_db
+	WHERE date > 2000
+	)
+	SELECT *, sp_dev*stock_dev AS cross_dev
+	FROM sp_table
+	JOIN stock_table ON stock_table.stock_date = sp_date
+	WHERE sp_past_30 IS NOT NULL AND stock_daily_gain < 0.99 AND stock_daily_gain > -0.99;
+
+CREATE TABLE beta_slope AS
+	SELECT sum((stock_daily_gain - (SELECT avg(stock_daily_gain) FROM stock_sp_table)) * (sp_daily_gain - (SELECT avg(sp_daily_gain) FROM stock_sp_table))) / sum((sp_daily_gain - (SELECT avg(sp_daily_gain) FROM stock_sp_table)) * (sp_daily_gain - (SELECT avg(sp_daily_gain) FROM stock_sp_table))) AS beta
+	FROM stock_sp_table;
+
+SELECT *
+FROM stock_sp_table;
+
+SELECT *
+FROM beta_slope;
+_____________________________________________________________________________________________________________________________________________________________________________
+
+'<Alternative Beta Calculation - Covariance Method>
+Is it accurate? Not sure'
+
+
+CREATE TABLE beta_cov_method AS
+	WITH sp_var_cov AS (
+	SELECT SUM(sp_cov_sq)/(COUNT(*) - 1) AS sp_var, sum(cross_dev)/(COUNT(*) - 1) AS sp_cov
+	FROM stock_sp_table)
+	SELECT sp_cov, sp_var, sp_cov / sp_var AS cov_method_beta
+	FROM sp_var_cov;
+
+SELECT *
+FROM beta_cov_method;
+_____________________________________________________________________________________________________________________________________________________________________________
+
+'<Finding CAGR>
+Assumption 1: total number of years is 23.5 years
+Asusmption 2: 10-year risk-free rate is 4.41%'
+
+
+CREATE TABLE stat_table (ticker TEXT, rf_rate INTEGER, rm_rate INTEGER, beta_slope INTEGER, sp_var INTEGER, sp_cov INTEGER);
+
+INSERT INTO stat_table (ticker, rf_rate, rm_rate, beta_slope, sp_var, sp_cov)
+VALUES ('msft', 0.0441,
+(SELECT POWER((SELECT close FROM sp_db ORDER BY date DESC LIMIT 1) / (SELECT close FROM sp_db ORDER BY date LIMIT 1), (1/23.5)) - 1),
+(SELECT * FROM beta_slope),
+(SELECT sp_var FROM beta_cov_method),
+(SELECT sp_cov FROM beta_cov_method));
+
+SELECT *, (rf_rate + (beta_slope) * (rm_rate - rf_rate)) AS CAGR
+FROM stat_table;
+____________________________________________________________________________________________________________________________________________________________________________
+
+'<Joining Financial Statements>'
+
+
+CREATE TABLE fin_table AS
+	SELECT * FROM stock_is INNER JOIN stock_bs ON stock_is.period = stock_bs.period INNER JOIN stock_cf ON stock_bs.period = stock_cf.period;
+_____________________________________________________________________________________________________________________________________________________________________________
+
+'<Finding WACC and Growth Rate>
+#Step 1: create wacc table structure for wacc variables and growth rates
+#Step 2: insert values into each column
+	equity_c: CAGR
+	equity_w: Total Equity / Total Assets
+	debt_c: Interest Expense / Total Debt
+	debt_w: Total Liability / Total Assets
+	tax_r: corporate tax rate (21%)
+	growth_r: average between "CAGR" and "average of internal growth rate" (no reason for calc using this method, just to compensate for recent high growth)
+	term_g: 3%
+	Other line item growth rates: average of yoy growth rates from financial statements'
+
+
+CREATE TABLE wacc_table (ticker TEXT, equity_c DECIMAL, equity_w DECIMAL, debt_c DECIMAL, debt_w DECIMAL, tax_r DECIMAL, growth_r DECIMAL, term_g DECIMAL, ebit_g DECIMAL, da_g DECIMAL, wc_g DECIMAL, capex_g DECIMAL);
+
+INSERT INTO wacc_table (ticker, equity_c, equity_w, debt_c, debt_w, tax_r, growth_r, term_g, ebit_g, da_g, wc_g, capex_g)
+VALUES ('msft',
+(SELECT (rf_rate + (beta_slope) * (rm_rate - rf_rate)) FROM stat_table),
+(SELECT [Stockholders Equity] / [Total Assets] FROM fin_table WHERE period = 'q2_24'),
+(SELECT [Interest Expense]*1.0 / [Total Debt]*1.0 FROM fin_table WHERE period = 'q2_24'),
+(SELECT ([Total Assets]-[Stockholders Equity]) / [Total Assets] FROM fin_table WHERE period = 'q2_24'), 0.21,
+(((SELECT (rf_rate + (beta_slope) * (rm_rate - rf_rate)) FROM stat_table WHERE ticker = 'msft') + (SELECT avg(igr) FROM (SELECT period, ([Net Income] / [Total Assets] * [Retained Earnings] / [Net Income]) AS igr FROM fin_table))) / 2), 0.03,
+(((((SELECT [EBIT] FROM fin_table WHERE period = 'q2_24') / (SELECT [EBIT] FROM fin_table WHERE period = 'q2_23')) - 1)+
+	(((SELECT [EBIT] FROM fin_table WHERE period = 'q2_23') / (SELECT [EBIT] FROM fin_table WHERE period = 'q2_22')) - 1)+
+	(((SELECT [EBIT] FROM fin_table WHERE period = 'q2_22') / (SELECT [EBIT] FROM fin_table WHERE period = 'q2_21')) -1)) / 3),
+(((((SELECT [Depreciation And Amortization]*1.0 FROM fin_table WHERE period = 'q2_24') / (SELECT [Depreciation And Amortization]*1.0 FROM fin_table WHERE period = 'q2_23')) - 1)+
+	(((SELECT [Depreciation And Amortization]*1.0 FROM fin_table WHERE period = 'q2_23') / (SELECT [Depreciation And Amortization]*1.0 FROM fin_table WHERE period = 'q2_22')) - 1)+
+	(((SELECT [Depreciation And Amortization]*1.0 FROM fin_table WHERE period = 'q2_22') / (SELECT [Depreciation And Amortization]*1.0 FROM fin_table WHERE period = 'q2_21')) - 1)) / 3),
+(((((SELECT [Working Capital]*1.0 FROM fin_table WHERE period = 'q2_24') / (SELECT [Working Capital]*1.0 FROM fin_table WHERE period = 'q2_23')) - 1)+
+	(((SELECT [Working Capital]*1.0 FROM fin_table WHERE period = 'q2_23') / (SELECT [Working Capital]*1.0 FROM fin_table WHERE period = 'q2_22')) - 1)+
+	(((SELECT [Working Capital]*1.0 FROM fin_table WHERE period = 'q2_22') / (SELECT [Working Capital]*1.0 FROM fin_table WHERE period = 'q2_21')) - 1)) / 3),
+(((((SELECT [Capital Expenditure]*1.0 FROM fin_table WHERE period = 'q2_24') / (SELECT [Capital Expenditure]*1.0 FROM fin_table WHERE period = 'q2_23')) - 1)+
+	(((SELECT [Capital Expenditure]*1.0 FROM fin_table WHERE period = 'q2_23') / (SELECT [Capital Expenditure]*1.0 FROM fin_table WHERE period = 'q2_22')) - 1)+
+	(((SELECT [Capital Expenditure]*1.0 FROM fin_table WHERE period = 'q2_22') / (SELECT [Capital Expenditure]*1.0 FROM fin_table WHERE period = 'q2_21')) - 1)) / 3));
+
+SELECT * FROM wacc_table;
+
+SELECT ticker, ((equity_c * equity_w) + ((debt_w * debt_c) * (1 - tax_r))) AS WACC
+FROM wacc_table;
+
+_____________________________________________________________________________________________________________________________________________________________________________
+
+'<Finding Implied Share Value>
+#Step 1: create a DCF table structure
+#Step 2: insert values into the DCF table
+	Number of years: 2 prior years + current year + 5 projected years + terminal value
+	Projected years and terminal values are calculated as present values
+Assumption: ticker is "msft"'
+
+
+CREATE TABLE dcf_table (ticker TEXT, period TEXT, cf INTEGER);
+
+WITH wacc AS (SELECT (equity_c * equity_w) + ((debt_w * debt_c) * (1 - tax_r)) FROM wacc_table WHERE ticker = 'msft')
+INSERT INTO dcf_table (ticker, period, cf)
+VALUES
+	('msft', 'a1', (SELECT ([EBIT] * (1 - (SELECT tax_r FROM wacc_table)) + [Depreciation And Amortization] + [Change in Working Capital] + [Capital Expenditure]) FROM fin_table WHERE period = 'q2_22')),
+	('msft', 'a2', (SELECT ([EBIT] * (1 - (SELECT tax_r FROM wacc_table)) + [Depreciation And Amortization] + [Change in Working Capital] + [Capital Expenditure]) FROM fin_table WHERE period = 'q2_23')),
+	('msft', 'a3', (SELECT ([EBIT] * (1 - (SELECT tax_r FROM wacc_table)) + [Depreciation And Amortization] + [Change in Working Capital] + [Capital Expenditure]) FROM fin_table WHERE period = 'q2_24')),
+	('msft', 'pv_f1', ((SELECT ([EBIT] * (1 + (SELECT ebit_g FROM wacc_table)) * (1 - (SELECT tax_r FROM wacc_table)) + [Depreciation And Amortization] * (1 + (SELECT da_g FROM wacc_table)) + [Change in Working Capital] * (1 + (SELECT wc_g FROM wacc_table)) + [Capital Expenditure] * (1 + (SELECT capex_g FROM wacc_table))) FROM fin_table WHERE period = 'q2_24')) / (1 + (SELECT * FROM wacc))),
+	('msft', 'pv_f2', ((SELECT ([EBIT] * POWER((1 + (SELECT ebit_g FROM wacc_table)), 2) * (1 - (SELECT tax_r FROM wacc_table)) + [Depreciation And Amortization] * POWER((1 + (SELECT da_g FROM wacc_table)), 2) + [Change in Working Capital] * POWER((1 + (SELECT wc_g FROM wacc_table)), 2) + [Capital Expenditure] * POWER((1 + (SELECT capex_g FROM wacc_table)), 2)) FROM fin_table WHERE period = 'q2_24')) / POWER((1 + (SELECT * FROM wacc)), 2)),
+	('msft', 'pv_f3', ((SELECT ([EBIT] * POWER((1 + (SELECT ebit_g FROM wacc_table)), 3) * (1 - (SELECT tax_r FROM wacc_table)) + [Depreciation And Amortization] * POWER((1 + (SELECT da_g FROM wacc_table)), 3) + [Change in Working Capital] * POWER((1 + (SELECT wc_g FROM wacc_table)), 3) + [Capital Expenditure] * POWER((1 + (SELECT capex_g FROM wacc_table)), 3)) FROM fin_table WHERE period = 'q2_24')) / POWER((1 + (SELECT * FROM wacc)), 3)),
+	('msft', 'pv_f4', ((SELECT ([EBIT] * POWER((1 + (SELECT ebit_g FROM wacc_table)), 4) * (1 - (SELECT tax_r FROM wacc_table)) + [Depreciation And Amortization] * POWER((1 + (SELECT da_g FROM wacc_table)), 4) + [Change in Working Capital] * POWER((1 + (SELECT wc_g FROM wacc_table)), 4) + [Capital Expenditure] * POWER((1 + (SELECT capex_g FROM wacc_table)), 4)) FROM fin_table WHERE period = 'q2_24')) / POWER((1 + (SELECT * FROM wacc)), 4)),
+	('msft', 'pv_f5', ((SELECT ([EBIT] * POWER((1 + (SELECT ebit_g FROM wacc_table)), 5) * (1 - (SELECT tax_r FROM wacc_table)) + [Depreciation And Amortization] * POWER((1 + (SELECT da_g FROM wacc_table)), 5) + [Change in Working Capital] * POWER((1 + (SELECT wc_g FROM wacc_table)), 5) + [Capital Expenditure] * POWER((1 + (SELECT capex_g FROM wacc_table)), 5)) FROM fin_table WHERE period = 'q2_24')) / POWER((1 + (SELECT * FROM wacc)), 5)),
+	('msft', 'pv_tv', (((SELECT ([EBIT] * (1 - (SELECT tax_r FROM wacc_table)) + [Depreciation And Amortization] + [Change in Working Capital] + [Capital Expenditure]) FROM fin_table WHERE period = 'q2_24') * (1 + (SELECT term_g FROM wacc_table)))/((SELECT (equity_c * equity_w) + ((debt_w * debt_c) * (1 - tax_r)) FROM wacc_table) - (SELECT term_g FROM wacc_table))) / (1 + (SELECT * FROM wacc)));
+
+SELECT * FROM dcf_table;
+
+SELECT ROUND((sum(cf) + (SELECT [Cash And Cash Equivalents] FROM fin_table WHERE period = 'q2_24') - (SELECT [Total Debt] FROM fin_table WHERE period = 'q2_24')) / (SELECT [Ordinary Shares Number] FROM fin_table), 2) AS 'Implied Share Price'
+FROM dcf_table
+WHERE ticker = 'msft';
